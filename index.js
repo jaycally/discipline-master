@@ -3,9 +3,7 @@ const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = r
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const fs = require('fs');
-const readline = require('readline');
 
-// Simple database for warnings
 const WARNINGS_FILE = './warnings.json';
 let warnings = {};
 if (fs.existsSync(WARNINGS_FILE)) warnings = JSON.parse(fs.readFileSync(WARNINGS_FILE));
@@ -14,40 +12,49 @@ const saveWarnings = () => fs.writeFileSync(WARNINGS_FILE, JSON.stringify(warnin
 const containsLink = (text) => /(https?:\/\/[^\s]+)|(www\.[^\s]+)|([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(\/\S*)?)/gi.test(text);
 
 const startBot = async () => {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version } = await fetchLatestBaileysVersion();
+    // Load session from environment variable
+    const sessionId = process.env.SESSION_ID;
+    let state, saveCreds;
     
+    if (sessionId) {
+        // Use provided Session ID
+        const { state: s, saveCreds: sc } = await useMultiFileAuthState('auth_info');
+        // Decode and inject session (simplified; we'll use a helper)
+        const { decode } = require('@whiskeysockets/baileys/lib/Utils');
+        const creds = decode(sessionId);
+        await s.creds.set(creds);
+        state = s;
+        saveCreds = sc;
+        console.log('✅ Session ID loaded. Connecting...');
+    } else {
+        // Fallback to normal auth (will require QR/pairing)
+        const auth = await useMultiFileAuthState('auth_info');
+        state = auth.state;
+        saveCreds = auth.saveCreds;
+        console.log('No SESSION_ID found. QR code will be printed.');
+    }
+
+    const { version } = await fetchLatestBaileysVersion();
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
         auth: state,
-        printQRInTerminal: false, // We'll use pairing code instead
+        printQRInTerminal: !sessionId, // Show QR only if no session
     });
 
-    // Use pairing code (no QR needed)
-    if (!sock.authState.creds.registered) {
-        console.log('\n🔑 Generating pairing code...');
-        const phoneNumber = process.env.PHONE_NUMBER; // Optional: set your bot's number with country code
-        const code = await sock.requestPairingCode(phoneNumber || '');
-        console.log('\n=========================================');
-        console.log(`   YOUR PAIRING CODE: ${code}`);
-        console.log('=========================================');
-        console.log('\n1. Open WhatsApp on your phone');
-        console.log('2. Go to Settings > Linked Devices > Link a Device');
-        console.log('3. Tap "Link with Phone Number Instead"');
-        console.log(`4. Enter the code: ${code}`);
-        console.log('\nWaiting for connection...\n');
-    }
-
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+            console.log('\n🔳 SCAN THIS QR CODE:\n');
+            console.log(qr);
+        }
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error instanceof Boom) &&
                 lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
             console.log('Connection closed. Reconnecting:', shouldReconnect);
             if (shouldReconnect) startBot();
         } else if (connection === 'open') {
-            console.log('✅ Discipline Master is online!');
+            console.log('✅ Discipline Master is ONLINE and protecting your group!');
         }
     });
 
@@ -66,7 +73,8 @@ const startBot = async () => {
                                msg.message.videoMessage?.caption || '';
 
         // Delete mass mentions
-        if (msg.message.extendedTextMessage?.contextInfo?.mentionedJid?.length >= 5 || messageContent.includes('@everyone')) {
+        const mentions = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
+        if (mentions.length >= 5 || messageContent.includes('@everyone')) {
             await sock.sendMessage(groupId, { delete: msg.key });
             await sock.sendMessage(groupId, { text: `@${sender.split('@')[0]} mass mentions are not allowed.`, mentions: [sender] });
             return;
