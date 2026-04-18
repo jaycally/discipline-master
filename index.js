@@ -8,7 +8,7 @@ const path = require('path');
 const WARNINGS_FILE = './warnings.json';
 let warnings = {};
 if (fs.existsSync(WARNINGS_FILE)) {
-    warnings = JSON.parse(fs.readFileSync(WARNINGS_FILE));
+    warnings = JSON.parse(fs.readFileSync(WARNINGS_FILE, 'utf-8'));
 }
 const saveWarnings = () => fs.writeFileSync(WARNINGS_FILE, JSON.stringify(warnings, null, 2));
 
@@ -20,7 +20,7 @@ if (!fs.existsSync(AUTH_FOLDER)) {
 }
 
 const startBot = async () => {
-    let authState = await useMultiFileAuthState(AUTH_FOLDER);
+    const authState = await useMultiFileAuthState(AUTH_FOLDER);
 
     const { version } = await fetchLatestBaileysVersion();
 
@@ -31,59 +31,44 @@ const startBot = async () => {
             creds: authState.state.creds,
             keys: makeCacheableSignalKeyStore(authState.state.keys, pino({ level: 'silent' }))
         },
-        printQRInTerminal: false,
+        printQRInTerminal: true,           // ← QR enabled
         browser: ['Chrome', 'Desktop', '1.0'],
         markOnlineOnConnect: false,
-        connectTimeoutMs: 60000,        // Give more time to connect
-        defaultQueryTimeoutMs: 60000,
+        connectTimeoutMs: 90000,          // longer timeout
+        defaultQueryTimeoutMs: 90000,
     });
 
     sock.ev.on('creds.update', authState.saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log('\n🔳 SCAN THIS QR CODE WITH WHATSAPP (Linked Devices):\n');
+            console.log(qr);   // This big string is the QR
+            console.log('\n→ Open WhatsApp → Linked Devices → Link a Device → Scan QR');
+            console.log('→ Or screenshot this log and scan from another phone if needed.\n');
+        }
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             console.log(`❌ Connection closed. Status: ${statusCode || 'unknown'}`);
 
             if (statusCode === DisconnectReason.loggedOut) {
-                console.log('Logged out. Delete auth_info folder and restart.');
+                console.log('❌ Logged out. Delete auth_info folder and redeploy if needed.');
                 return;
             }
 
-            // Avoid too aggressive reconnects
-            console.log('Reconnecting in 8 seconds...');
-            setTimeout(() => startBot(), 8000);
+            console.log('🔄 Reconnecting in 12 seconds...');
+            setTimeout(() => startBot(), 12000);
         } 
         else if (connection === 'open') {
             console.log('✅ Discipline Master is ONLINE and moderating the group!');
+            console.log('Bot is now active — test by sending a link in your group.');
         }
     });
 
-    // Request pairing code with delay for better stability
-    setTimeout(async () => {
-        if (!authState.state.creds.registered) {
-            console.log('🔢 Requesting pairing code (delayed for stability)...');
-            const phoneNumber = '2547XXXXXXXXXX';   // ←←← YOUR NUMBER HERE (no +)
-
-            try {
-                const code = await sock.requestPairingCode(phoneNumber);
-                console.log('\n════════════════════════════════════');
-                console.log(`📱 YOUR PAIRING CODE: ${code}`);
-                console.log('════════════════════════════════════');
-                console.log('→ Open WhatsApp → Linked Devices → Link with phone number');
-                console.log('→ Enter the code above.\n');
-            } catch (err) {
-                console.error('Failed to generate pairing code:', err.message);
-                if (err.message.includes('Connection Closed')) {
-                    console.log('⚠️ This is common on Railway. Try again after redeploy or use a code if one appeared before.');
-                }
-            }
-        }
-    }, 5000);   // 5 second delay
-
-    // Your original message handler (unchanged)
+    // === Your original moderation logic (unchanged) ===
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
