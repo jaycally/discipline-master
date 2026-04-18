@@ -2,7 +2,6 @@ const makeWASocket = require('@whiskeysockets/baileys').default;
 const { useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
-const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 
 // Simple database to store warnings (warnings.json)
@@ -28,24 +27,34 @@ const startBot = async () => {
     
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: true, // Shows QR in Railway logs
         auth: state,
     });
 
-    // Show QR code in terminal (for Railway logs)
+    // Handle connection updates - this is where QR code comes
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
+        
+        // 🔥 THIS IS THE IMPORTANT PART - Print QR code clearly
         if (qr) {
-            qrcode.generate(qr, { small: true });
-            console.log('Scan the QR code above with WhatsApp (Linked Devices)');
+            console.log('\n\n');
+            console.log('=========================================');
+            console.log('         SCAN THIS QR CODE NOW');
+            console.log('=========================================');
+            console.log(qr); // Raw string QR for terminal scanning
+            console.log('=========================================\n\n');
         }
+        
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error instanceof Boom) &&
                 lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
             console.log('Connection closed. Reconnecting:', shouldReconnect);
-            if (shouldReconnect) startBot();
+            if (shouldReconnect) {
+                startBot();
+            } else {
+                console.log('Logged out. Delete auth_info folder and restart.');
+            }
         } else if (connection === 'open') {
-            console.log('Bot is online!');
+            console.log('✅ Bot is online and ready!');
         }
     });
 
@@ -56,7 +65,7 @@ const startBot = async () => {
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message) return;
-        if (msg.key.fromMe) return; // Ignore bot's own messages
+        if (msg.key.fromMe) return;
         
         const sender = msg.key.participant || msg.key.remoteJid;
         const groupId = msg.key.remoteJid;
@@ -69,9 +78,8 @@ const startBot = async () => {
         // Only act in groups
         if (!groupId.endsWith('@g.us')) return;
 
-        // 1. Delete mentions (@everyone)
+        // 1. Delete mentions (@everyone or mass mentions)
         if (msg.message.extendedTextMessage?.contextInfo?.mentionedJid?.length > 0) {
-            // Check if it's a mass mention (more than 5 people) or an @everyone pattern
             const mentionedCount = msg.message.extendedTextMessage.contextInfo.mentionedJid.length;
             if (mentionedCount >= 5 || messageContent.includes('@everyone')) {
                 await sock.sendMessage(groupId, { delete: msg.key });
@@ -87,7 +95,6 @@ const startBot = async () => {
         if (containsLink(messageContent)) {
             await sock.sendMessage(groupId, { delete: msg.key });
             
-            // Initialize warning tracker
             if (!warnings[groupId]) warnings[groupId] = {};
             if (!warnings[groupId][sender]) warnings[groupId][sender] = 0;
             
@@ -97,17 +104,14 @@ const startBot = async () => {
             const warnCount = warnings[groupId][sender];
             
             if (warnCount >= 3) {
-                // Kick user
                 await sock.groupParticipantsUpdate(groupId, [sender], 'remove');
                 await sock.sendMessage(groupId, { 
                     text: `@${sender.split('@')[0]} has been kicked for sending links 3 times.`,
                     mentions: [sender]
                 });
-                // Reset warnings
                 delete warnings[groupId][sender];
                 saveWarnings();
             } else {
-                // Send warning message
                 await sock.sendMessage(groupId, { 
                     text: `@${sender.split('@')[0]} links are not allowed. Warning ${warnCount}/3.`,
                     mentions: [sender]
