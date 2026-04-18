@@ -14,30 +14,13 @@ const saveWarnings = () => fs.writeFileSync(WARNINGS_FILE, JSON.stringify(warnin
 
 const containsLink = (text) => /(https?:\/\/[^\s]+)|(www\.[^\s]+)|([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(\/\S*)?)/gi.test(text);
 
-// Create auth folder (important for Railway Volume)
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 if (!fs.existsSync(AUTH_FOLDER)) {
     fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 }
 
 const startBot = async () => {
-    let authState;
-    const sessionId = process.env.SESSION_ID;
-
-    if (sessionId) {
-        // Keep your original SESSION_ID support
-        try {
-            const decoded = Buffer.from(sessionId, 'base64').toString('utf-8');
-            const creds = JSON.parse(decoded);
-            authState = { state: { creds, keys: {} }, saveCreds: () => {} };
-            console.log('✅ Using provided SESSION_ID');
-        } catch (e) {
-            console.log('Invalid SESSION_ID, falling back to normal auth...');
-            authState = await useMultiFileAuthState(AUTH_FOLDER);
-        }
-    } else {
-        authState = await useMultiFileAuthState(AUTH_FOLDER);
-    }
+    let authState = await useMultiFileAuthState(AUTH_FOLDER);
 
     const { version } = await fetchLatestBaileysVersion();
 
@@ -48,54 +31,59 @@ const startBot = async () => {
             creds: authState.state.creds,
             keys: makeCacheableSignalKeyStore(authState.state.keys, pino({ level: 'silent' }))
         },
-        printQRInTerminal: false,     // Disabled - we use pairing code
+        printQRInTerminal: false,
         browser: ['Chrome', 'Desktop', '1.0'],
         markOnlineOnConnect: false,
+        connectTimeoutMs: 60000,        // Give more time to connect
+        defaultQueryTimeoutMs: 60000,
     });
 
     sock.ev.on('creds.update', authState.saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            console.log('QR received but we are using pairing code instead.');
-        }
+        const { connection, lastDisconnect } = update;
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            console.log(`Connection closed. Status: ${statusCode}. Reconnecting...`);
+            console.log(`❌ Connection closed. Status: ${statusCode || 'unknown'}`);
 
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) {
-                setTimeout(() => startBot(), 5000); // Wait 5 seconds before reconnect
-            } else {
-                console.log('❌ Logged out. Delete auth_info folder and restart the bot.');
+            if (statusCode === DisconnectReason.loggedOut) {
+                console.log('Logged out. Delete auth_info folder and restart.');
+                return;
             }
+
+            // Avoid too aggressive reconnects
+            console.log('Reconnecting in 8 seconds...');
+            setTimeout(() => startBot(), 8000);
         } 
         else if (connection === 'open') {
             console.log('✅ Discipline Master is ONLINE and moderating the group!');
         }
     });
 
-    // === Pairing Code (Best for Railway) ===
-    if (!authState.state.creds.registered) {
-        console.log('🔢 Requesting pairing code...');
-        const phoneNumber = '2547XXXXXXXXXX';   // ←←← CHANGE THIS TO YOUR WHATSAPP NUMBER (no +)
-        
-        try {
-            const code = await sock.requestPairingCode(phoneNumber);
-            console.log('\n════════════════════════════════════');
-            console.log(`📱 YOUR PAIRING CODE: ${code}`);
-            console.log('════════════════════════════════════');
-            console.log('Go to WhatsApp on your phone → Linked Devices → "Link a Device"');
-            console.log('Choose "Link with phone number" and enter the code above.\n');
-        } catch (err) {
-            console.error('Failed to generate pairing code:', err.message);
-        }
-    }
+    // Request pairing code with delay for better stability
+    setTimeout(async () => {
+        if (!authState.state.creds.registered) {
+            console.log('🔢 Requesting pairing code (delayed for stability)...');
+            const phoneNumber = '2547XXXXXXXXXX';   // ←←← YOUR NUMBER HERE (no +)
 
-    // Message handler (your original logic - unchanged)
+            try {
+                const code = await sock.requestPairingCode(phoneNumber);
+                console.log('\n════════════════════════════════════');
+                console.log(`📱 YOUR PAIRING CODE: ${code}`);
+                console.log('════════════════════════════════════');
+                console.log('→ Open WhatsApp → Linked Devices → Link with phone number');
+                console.log('→ Enter the code above.\n');
+            } catch (err) {
+                console.error('Failed to generate pairing code:', err.message);
+                if (err.message.includes('Connection Closed')) {
+                    console.log('⚠️ This is common on Railway. Try again after redeploy or use a code if one appeared before.');
+                }
+            }
+        }
+    }, 5000);   // 5 second delay
+
+    // Your original message handler (unchanged)
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -109,7 +97,7 @@ const startBot = async () => {
                                msg.message.imageMessage?.caption ||
                                msg.message.videoMessage?.caption || '';
 
-        // Delete mass mentions
+        // Mass mentions
         const mentions = msg.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
         if (mentions.length >= 5 || messageContent.includes('@everyone')) {
             await sock.sendMessage(groupId, { delete: msg.key });
@@ -120,7 +108,7 @@ const startBot = async () => {
             return;
         }
 
-        // Anti-link with 3-strike kick
+        // Anti-link 3 strikes
         if (containsLink(messageContent)) {
             await sock.sendMessage(groupId, { delete: msg.key });
 
@@ -150,6 +138,4 @@ const startBot = async () => {
     });
 };
 
-startBot().catch(err => {
-    console.error('Fatal error:', err);
-});
+startBot().catch(err => console.error('Fatal error:', err));
