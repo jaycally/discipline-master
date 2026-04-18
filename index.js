@@ -1,5 +1,5 @@
 const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const fs = require('fs');
@@ -11,41 +11,48 @@ const saveWarnings = () => fs.writeFileSync(WARNINGS_FILE, JSON.stringify(warnin
 
 const containsLink = (text) => /(https?:\/\/[^\s]+)|(www\.[^\s]+)|([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(\/\S*)?)/gi.test(text);
 
+// Function to decode session ID if provided
+const getAuthFromSession = async (sessionId) => {
+    if (!sessionId) return null;
+    try {
+        // If sessionId is base64 encoded JSON
+        const decoded = Buffer.from(sessionId, 'base64').toString('utf-8');
+        const creds = JSON.parse(decoded);
+        return { creds, keys: {} };
+    } catch (e) {
+        console.error('Invalid SESSION_ID format. Falling back to QR.');
+        return null;
+    }
+};
+
 const startBot = async () => {
-    // Load session from environment variable
     const sessionId = process.env.SESSION_ID;
-    let state, saveCreds;
-    
+    let authState;
+
     if (sessionId) {
-        // Use provided Session ID
-        const { state: s, saveCreds: sc } = await useMultiFileAuthState('auth_info');
-        // Decode and inject session (simplified; we'll use a helper)
-        const { decode } = require('@whiskeysockets/baileys/lib/Utils');
-        const creds = decode(sessionId);
-        await s.creds.set(creds);
-        state = s;
-        saveCreds = sc;
-        console.log('✅ Session ID loaded. Connecting...');
+        const customAuth = await getAuthFromSession(sessionId);
+        if (customAuth) {
+            authState = { state: customAuth, saveCreds: () => {} };
+            console.log('✅ Using provided SESSION_ID');
+        } else {
+            authState = await useMultiFileAuthState('auth_info');
+        }
     } else {
-        // Fallback to normal auth (will require QR/pairing)
-        const auth = await useMultiFileAuthState('auth_info');
-        state = auth.state;
-        saveCreds = auth.saveCreds;
-        console.log('No SESSION_ID found. QR code will be printed.');
+        authState = await useMultiFileAuthState('auth_info');
     }
 
     const { version } = await fetchLatestBaileysVersion();
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
-        auth: state,
-        printQRInTerminal: !sessionId, // Show QR only if no session
+        auth: authState.state,
+        printQRInTerminal: true, // Will show QR if no session works
     });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
-            console.log('\n🔳 SCAN THIS QR CODE:\n');
+            console.log('\n🔳 SCAN THIS QR CODE WITH WHATSAPP (Linked Devices):\n');
             console.log(qr);
         }
         if (connection === 'close') {
@@ -54,11 +61,11 @@ const startBot = async () => {
             console.log('Connection closed. Reconnecting:', shouldReconnect);
             if (shouldReconnect) startBot();
         } else if (connection === 'open') {
-            console.log('✅ Discipline Master is ONLINE and protecting your group!');
+            console.log('✅ Discipline Master is ONLINE!');
         }
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', authState.saveCreds);
 
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
